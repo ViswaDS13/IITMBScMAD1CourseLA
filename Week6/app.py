@@ -1,17 +1,18 @@
-import os
-from flask import Flask, request, jsonify
+import json
+from flask import Flask, request, jsonify, make_response
 from flask_sqlalchemy import SQLAlchemy
-from flask_restful import Api, Resource
+from flask_restful import Api, Resource, reqparse, fields, marshal_with
 
 app = Flask(__name__)
-
-# Mandatory Configuration Parameters
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///api_database.sqlite3'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
 db = SQLAlchemy(app)
 api = Api(app)
 
-# ==================== DATABASE SCHEMAS ====================
+# -----------------------------------------------------------------------------
+# Database Models
+# -----------------------------------------------------------------------------
 
 class Course(db.Model):
     __tablename__ = 'course'
@@ -20,6 +21,7 @@ class Course(db.Model):
     course_code = db.Column(db.String, unique=True, nullable=False)
     course_description = db.Column(db.String)
 
+
 class Student(db.Model):
     __tablename__ = 'student'
     student_id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -27,226 +29,306 @@ class Student(db.Model):
     first_name = db.Column(db.String, nullable=False)
     last_name = db.Column(db.String)
 
-class Enrollments(db.Model):
-    __tablename__ = 'enrollments'
+
+class Enrollment(db.Model):
+    __tablename__ = 'enrollment'
     enrollment_id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     student_id = db.Column(db.Integer, db.ForeignKey('student.student_id'), nullable=False)
     course_id = db.Column(db.Integer, db.ForeignKey('course.course_id'), nullable=False)
 
-# ==================== HELPER SERIALIZERS ====================
+# -----------------------------------------------------------------------------
+# Helper Functions & Formatting
+# -----------------------------------------------------------------------------
 
-def serialize_course(c):
-    return {
-        "course_id": c.course_id,
-        "course_name": c.course_name,
-        "course_code": c.course_code,
-        "course_description": c.course_description or ""
+def error_response(error_code, error_message, status_code=400):
+    body = {
+        "error_code": error_code,
+        "error_message": error_message
     }
+    return make_response(jsonify(body), status_code)
 
-def serialize_student(s):
-    return {
-        "student_id": s.student_id,
-        "first_name": s.first_name,
-        "last_name": s.last_name or "",
-        "roll_number": s.roll_number
-    }
 
-def serialize_enrollment(e):
-    return {
-        "enrollment_id": e.enrollment_id,
-        "student_id": e.student_id,
-        "course_id": e.course_id
-    }
-
-# ==================== RESTful RESOURCES ====================
+# -----------------------------------------------------------------------------
+# Course Resources
+# -----------------------------------------------------------------------------
 
 class CourseAPI(Resource):
     def get(self, course_id):
         course = Course.query.get(course_id)
         if not course:
-            return {"error_code": "COURSE_NOT_FOUND", "error_message": "Course not found"}, 404
-        return jsonify(serialize_course(course))
+            return make_response("", 404)
+        
+        return {
+            "course_id": course.course_id,
+            "course_name": course.course_name,
+            "course_code": course.course_code,
+            "course_description": course.course_description
+        }, 200
 
     def put(self, course_id):
         course = Course.query.get(course_id)
         if not course:
-            return {"error_code": "COURSE_NOT_FOUND", "error_message": "Course not found"}, 404
+            return make_response("", 404)
+            
+        data = request.get_json(force=True, silent=True) or {}
         
-        data = request.get_json() or {}
-        
-        if 'course_name' in data and (data['course_name'] is None or str(data['course_name']).strip() == ""):
-            return {"error_code": "COURSE001", "error_message": "Course Name is required"}, 400
-        if 'course_code' in data and (data['course_code'] is None or str(data['course_code']).strip() == ""):
-            return {"error_code": "COURSE002", "error_message": "Course Code is required"}, 400
+        c_name = data.get('course_name')
+        c_code = data.get('course_code')
+        c_desc = data.get('course_description')
 
-        if 'course_name' in data:
-            course.course_name = data['course_name']
-        if 'course_code' in data:
-            course.course_code = data['course_code']
-        if 'course_description' in data:
-            course.course_description = data['course_description']
+        if not c_name:
+            return error_response("COURSE001", "Course Name is required", 400)
+        if not c_code:
+            return error_response("COURSE002", "Course Code is required", 400)
 
+        course.course_name = c_name
+        course.course_code = c_code
+        course.course_description = c_desc
         db.session.commit()
-        return jsonify(serialize_course(course))
+
+        return {
+            "course_id": course.course_id,
+            "course_name": course.course_name,
+            "course_code": course.course_code,
+            "course_description": course.course_description
+        }, 200
 
     def delete(self, course_id):
         course = Course.query.get(course_id)
         if not course:
-            return {"error_code": "COURSE_NOT_FOUND", "error_message": "Course not found"}, 404
+            return make_response("", 404)
+            
+        # Delete associated enrollments first
+        Enrollment.query.filter_by(course_id=course_id).delete()
         
-        Enrollments.query.filter_by(course_id=course_id).delete()
         db.session.delete(course)
         db.session.commit()
-        return {}, 200
+        return "", 200
 
 
 class CourseListAPI(Resource):
     def post(self):
-        data = request.get_json() or {}
+        data = request.get_json(force=True, silent=True) or {}
         
-        if 'course_name' not in data or data['course_name'] is None or str(data['course_name']).strip() == "":
-            return {"error_code": "COURSE001", "error_message": "Course Name is required"}, 400
-        if 'course_code' not in data or data['course_code'] is None or str(data['course_code']).strip() == "":
-            return {"error_code": "COURSE002", "error_message": "Course Code is required"}, 400
+        c_name = data.get('course_name')
+        c_code = data.get('course_code')
+        c_desc = data.get('course_description', '')
 
-        existing = Course.query.filter_by(course_code=data['course_code']).first()
-        if existing:
-            return {"error_code": "COURSE_ALREADY_EXISTS", "error_message": "course_code already exist"}, 409
+        if not c_name:
+            return error_response("COURSE001", "Course Name is required", 400)
+        if not c_code:
+            return error_response("COURSE002", "Course Code is required", 400)
+
+        # Check for existing course code uniqueness
+        existing_course = Course.query.filter_by(course_code=c_code).first()
+        if existing_course:
+            return make_response("", 409)
 
         new_course = Course(
-            course_name=data['course_name'],
-            course_code=data['course_code'],
-            course_description=data.get('course_description', '')
+            course_name=c_name,
+            course_code=c_code,
+            course_description=c_desc
         )
         db.session.add(new_course)
         db.session.commit()
-        return serialize_course(new_course), 201
 
+        return {
+            "course_id": new_course.course_id,
+            "course_name": new_course.course_name,
+            "course_code": new_course.course_code,
+            "course_description": new_course.course_description
+        }, 201
+
+
+# -----------------------------------------------------------------------------
+# Student Resources
+# -----------------------------------------------------------------------------
 
 class StudentAPI(Resource):
     def get(self, student_id):
         student = Student.query.get(student_id)
         if not student:
-            return {"error_code": "STUDENT_NOT_FOUND", "error_message": "Student not found"}, 404
-        return jsonify(serialize_student(student))
+            return make_response("", 404)
+            
+        return {
+            "student_id": student.student_id,
+            "roll_number": student.roll_number,
+            "first_name": student.first_name,
+            "last_name": student.last_name
+        }, 200
 
     def put(self, student_id):
         student = Student.query.get(student_id)
         if not student:
-            return {"error_code": "STUDENT_NOT_FOUND", "error_message": "Student not found"}, 404
-        
-        data = request.get_json() or {}
-        
-        if 'roll_number' in data and (data['roll_number'] is None or str(data['roll_number']).strip() == ""):
-            return {"error_code": "STUDENT001", "error_message": "Roll Number required"}, 400
-        if 'first_name' in data and (data['first_name'] is None or str(data['first_name']).strip() == ""):
-            return {"error_code": "STUDENT002", "error_message": "First Name is required"}, 400
+            return make_response("", 404)
 
-        if 'roll_number' in data:
-            student.roll_number = data['roll_number']
-        if 'first_name' in data:
-            student.first_name = data['first_name']
-        if 'last_name' in data:
-            student.last_name = data['last_name']
+        data = request.get_json(force=True, silent=True) or {}
+        
+        roll_num = data.get('roll_number')
+        f_name = data.get('first_name')
+        l_name = data.get('last_name')
 
+        if not roll_num:
+            return error_response("STUDENT001", "Roll Number required", 400)
+        if not f_name:
+            return error_response("STUDENT002", "First Name is required", 400)
+
+        student.roll_number = roll_num
+        student.first_name = f_name
+        student.last_name = l_name
         db.session.commit()
-        return jsonify(serialize_student(student))
+
+        return {
+            "student_id": student.student_id,
+            "roll_number": student.roll_number,
+            "first_name": student.first_name,
+            "last_name": student.last_name
+        }, 200
 
     def delete(self, student_id):
         student = Student.query.get(student_id)
         if not student:
-            return {"error_code": "STUDENT_NOT_FOUND", "error_message": "Student not found"}, 404
-        
-        Enrollments.query.filter_by(student_id=student_id).delete()
+            return make_response("", 404)
+
+        # Delete associated enrollments
+        Enrollment.query.filter_by(student_id=student_id).delete()
+
         db.session.delete(student)
         db.session.commit()
-        return {}, 200
+        return "", 200
 
 
 class StudentListAPI(Resource):
     def post(self):
-        data = request.get_json() or {}
+        data = request.get_json(force=True, silent=True) or {}
         
-        if 'roll_number' not in data or data['roll_number'] is None or str(data['roll_number']).strip() == "":
-            return {"error_code": "STUDENT001", "error_message": "Roll Number required"}, 400
-        if 'first_name' not in data or data['first_name'] is None or str(data['first_name']).strip() == "":
-            return {"error_code": "STUDENT002", "error_message": "First Name is required"}, 400
+        roll_num = data.get('roll_number')
+        f_name = data.get('first_name')
+        l_name = data.get('last_name', '')
 
-        existing = Student.query.filter_by(roll_number=data['roll_number']).first()
-        if existing:
-            return {"error_code": "STUDENT_ALREADY_EXISTS", "error_message": "Student already exist"}, 409
+        if not roll_num:
+            return error_response("STUDENT001", "Roll Number required", 400)
+        if not f_name:
+            return error_response("STUDENT002", "First Name is required", 400)
+
+        existing_student = Student.query.filter_by(roll_number=roll_num).first()
+        if existing_student:
+            return make_response("", 409)
 
         new_student = Student(
-            roll_number=data['roll_number'],
-            first_name=data['first_name'],
-            last_name=data.get('last_name', '')
+            roll_number=roll_num,
+            first_name=f_name,
+            last_name=l_name
         )
         db.session.add(new_student)
         db.session.commit()
-        return serialize_student(new_student), 201
+
+        return {
+            "student_id": new_student.student_id,
+            "roll_number": new_student.roll_number,
+            "first_name": new_student.first_name,
+            "last_name": new_student.last_name
+        }, 201
 
 
-class StudentEnrollmentAPI(Resource):
+# -----------------------------------------------------------------------------
+# Enrollment Resources
+# -----------------------------------------------------------------------------
+
+class StudentCourseAPI(Resource):
     def get(self, student_id):
         student = Student.query.get(student_id)
         if not student:
-            return {"error_code": "ENROLLMENT002", "error_message": "Student does not exist."}, 404
-        
-        enrollments = Enrollments.query.filter_by(student_id=student_id).all()
+            return error_response("ENROLLMENT002", "Student does not exist.", 400)
+
+        enrollments = Enrollment.query.filter_by(student_id=student_id).all()
         if not enrollments:
-            return {"error_code": "NO_ENROLLMENTS", "error_message": "Student is not enrolled in any course"}, 404
-            
-        return jsonify([serialize_enrollment(e) for e in enrollments])
+            return make_response("", 404)
+
+        result = []
+        for e in enrollments:
+            course = Course.query.get(e.course_id)
+            if course:
+                result.append({
+                    "course_id": course.course_id,
+                    "course_name": course.course_name,
+                    "course_code": course.course_code,
+                    "course_description": course.course_description
+                })
+
+        return result, 200
 
     def post(self, student_id):
         student = Student.query.get(student_id)
         if not student:
-            return {"error_code": "ENROLLMENT002", "error_message": "Student does not exist."}, 404
-            
-        data = request.get_json() or {}
-        course_id = data.get('course_id')
-        
-        course = Course.query.get(course_id)
-        if not course:
-            return {"error_code": "ENROLLMENT001", "error_message": "Course does not exist"}, 400
+            return error_response("ENROLLMENT002", "Student does not exist", 400)
 
-        # Check if enrollment already exists to protect consistency
-        existing = Enrollments.query.filter_by(student_id=student_id, course_id=course_id).first()
+        data = request.get_json(force=True, silent=True) or {}
+        c_id = data.get('course_id')
+
+        if not c_id:
+            return error_response("ENROLLMENT001", "Course does not exist", 400)
+
+        course = Course.query.get(c_id)
+        if not course:
+            return error_response("ENROLLMENT001", "Course does not exist", 400)
+
+        # Create enrollment if it doesn't already exist
+        existing = Enrollment.query.filter_by(student_id=student_id, course_id=c_id).first()
         if not existing:
-            new_enrollment = Enrollments(student_id=student_id, course_id=course_id)
+            new_enrollment = Enrollment(student_id=student_id, course_id=c_id)
             db.session.add(new_enrollment)
             db.session.commit()
 
-        all_enrollments = Enrollments.query.filter_by(student_id=student_id).all()
-        return jsonify([serialize_enrollment(e) for e in all_enrollments]), 201
+        # Fetch all enrolled courses for the response
+        all_enrollments = Enrollment.query.filter_by(student_id=student_id).all()
+        result = []
+        for e in all_enrollments:
+            c = Course.query.get(e.course_id)
+            if c:
+                result.append({
+                    "course_id": c.course_id,
+                    "course_name": c.course_name,
+                    "course_code": c.course_code,
+                    "course_description": c.course_description
+                })
+
+        return result, 201
 
 
-class EnrollmentDeleteAPI(Resource):
+class StudentCourseDeleteAPI(Resource):
     def delete(self, student_id, course_id):
         student = Student.query.get(student_id)
-        course = Course.query.get(course_id)
-        
         if not student:
-            return {"error_code": "ENROLLMENT002", "error_message": "Student does not exist."}, 400
+            return error_response("ENROLLMENT002", "Student does not exist", 400)
+
+        course = Course.query.get(course_id)
         if not course:
-            return {"error_code": "ENROLLMENT001", "error_message": "Course does not exist"}, 400
-            
-        enrollment = Enrollments.query.filter_by(student_id=student_id, course_id=course_id).first()
+            return error_response("ENROLLMENT001", "Course does not exist", 400)
+
+        enrollment = Enrollment.query.filter_by(student_id=student_id, course_id=course_id).first()
         if not enrollment:
-            return {"error_code": "ENROLLMENT_NOT_FOUND", "error_message": "Enrollment for the student not found"}, 404
-            
+            return make_response("", 404)
+
         db.session.delete(enrollment)
         db.session.commit()
-        return {}, 200
 
-# ==================== MAP ROUTING PATHS ====================
+        return "", 200
 
-api.add_resource(CourseListAPI, '/api/course')
+
+# -----------------------------------------------------------------------------
+# API Endpoints Routing
+# -----------------------------------------------------------------------------
+
 api.add_resource(CourseAPI, '/api/course/<int:course_id>')
-api.add_resource(StudentListAPI, '/api/student')
+api.add_resource(CourseListAPI, '/api/course')
+
 api.add_resource(StudentAPI, '/api/student/<int:student_id>')
-api.add_resource(StudentEnrollmentAPI, '/api/student/<int:student_id>/course')
-api.add_resource(EnrollmentDeleteAPI, '/api/student/<int:student_id>/course/<int:course_id>')
+api.add_resource(StudentListAPI, '/api/student')
+
+api.add_resource(StudentCourseAPI, '/api/student/<int:student_id>/course')
+api.add_resource(StudentCourseDeleteAPI, '/api/student/<int:student_id>/course/<int:course_id>')
+
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run()
